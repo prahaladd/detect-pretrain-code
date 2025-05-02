@@ -11,6 +11,8 @@ import numpy as np
 from datasets import load_dataset
 from options import Options
 from eval import *
+import os
+from openai import OpenAI
 
 
 def load_model(name1, name2):
@@ -35,20 +37,35 @@ def calculatePerplexity_gpt3(prompt, modelname):
     prompt = prompt.replace('\x00','')
     responses = None
     # Put your API key here
-    openai.api_key = "YOUR_API_KEY" # YOUR_API_KEY
-    while responses is None:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)
+    # Map old model names to new ones
+    model_mapping = {
+        "text-davinci-003": "gpt-3.5-turbo-instruct",
+        "text-davinci-002": "gpt-3.5-turbo-instruct"
+    }
+    modelname = model_mapping.get(modelname, modelname)
+    retryCount = 0
+    while responses is None and retryCount < 3:
         try:
-            responses = openai.Completion.create(
-                        engine=modelname, 
+            responses = client.completions.create(
+                        model=modelname, 
                         prompt=prompt,
-                        max_tokens=0,
+                        max_tokens=1,  # We need at least 1 token to get logprobs
                         temperature=1.0,
                         logprobs=5,
-                        echo=True)
-        except openai.error.InvalidRequestError:
-            print("too long for openai API")
-    data = responses["choices"][0]["logprobs"]
-    all_prob = [d for d in data["token_logprobs"] if d is not None]
+                        echo=False)
+        except openai.BadRequestError as e:
+            print(f"OpenAI API Error: {str(e)}")
+            if "maximum context length" in str(e).lower():
+                print("The input text is too long for the model's context window. Consider using a shorter text or a model with a larger context window.")
+            elif "logprobs" in str(e).lower():
+                print("The logprobs parameter is not supported or exceeds the maximum value of 5.")
+            else:
+                print("Please check the OpenAI API documentation for more details about the error.")
+            retryCount += 1
+    data = responses.choices[0].logprobs
+    all_prob = [d for d in data.token_logprobs if d is not None]
     p1 = np.exp(-np.mean(all_prob))
     return p1, all_prob, np.mean(all_prob)
 
@@ -57,8 +74,10 @@ def calculatePerplexity(sentence, model, tokenizer, gpu):
     """
     exp(loss)
     """
+    # Set the default device to mps
+    torch.set_default_device("mps")
     input_ids = torch.tensor(tokenizer.encode(sentence)).unsqueeze(0)
-    input_ids = input_ids.to(gpu)
+    input_ids = input_ids.to("mps")
     with torch.no_grad():
         outputs = model(input_ids, labels=input_ids)
     loss, logits = outputs[:2]
